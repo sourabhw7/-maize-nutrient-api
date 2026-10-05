@@ -30,6 +30,11 @@ IMG_SIZE = (224, 224)
 CONF_THRESHOLD = 0.60
 MAX_BYTES = 5 * 1024 * 1024
 
+# ---- Safeguards against non-leaf photos (tune these after testing) ----
+MIN_CONF = 0.70     # top class must have at least 70% probability
+MIN_MARGIN = 0.15   # top class must beat the 2nd class by at least 15 points
+MIN_PLANT = 0.05    # at least 5% of pixels must be leaf-coloured (yellow-green range)
+
 # Confirmed alphabetical order (matches how Keras sorted the training folders)
 CLASSES = ['ALL Present', 'ALLAB', 'KAB', 'NAB', 'PAB', 'ZNAB']
 
@@ -85,14 +90,39 @@ ADVISORY = {
 }
 
 
-def preprocess_image(image_bytes: bytes) -> np.ndarray:
+def load_image(image_bytes: bytes) -> Image.Image:
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return img.resize(IMG_SIZE, Image.BILINEAR)
+
+
+def to_tensor(img: Image.Image) -> np.ndarray:
     # Matches the training pipeline exactly: PIL, RGB, bilinear resize, raw 0-255 pixels.
     # Preprocessing (mobilenet_v2 preprocess_input) is baked INSIDE the model itself,
     # so we must NOT normalize or divide by 255 here.
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    img = img.resize(IMG_SIZE, Image.BILINEAR)
     arr = np.asarray(img, dtype=np.float32)
     return np.expand_dims(arr, axis=0)
+
+
+def plant_ratio(img: Image.Image) -> float:
+    """Fraction of pixels in the yellow-to-green colour range (leaf-like)."""
+    hsv = np.asarray(img.convert("HSV"), dtype=np.float32)
+    h = hsv[..., 0] * 360.0 / 255.0
+    s = hsv[..., 1] / 255.0
+    v = hsv[..., 2] / 255.0
+    mask = (h >= 30) & (h <= 170) & (s >= 0.20) & (v >= 0.15)
+    return float(mask.mean())
+
+
+def reject_reason(probs: np.ndarray, ratio: float):
+    order = np.argsort(probs)[::-1]
+    top1, top2 = float(probs[order[0]]), float(probs[order[1]])
+    if ratio < MIN_PLANT:
+        return "no_plant"
+    if top1 < MIN_CONF:
+        return "low_conf"
+    if top1 - top2 < MIN_MARGIN:
+        return "ambiguous"
+    return None
 
 
 @app.get("/")
@@ -115,7 +145,8 @@ async def diagnose(file: UploadFile = File(...)):
         raise HTTPException(413, "Image is too large (max 5 MB).")
 
     try:
-        tensor = preprocess_image(contents)
+        img = load_image(contents)
+        tensor = to_tensor(img)
     except Exception:
         raise HTTPException(400, "Could not read this image.")
 
@@ -124,6 +155,20 @@ async def diagnose(file: UploadFile = File(...)):
     best_idx = int(order[0])
     label = CLASSES[best_idx]
     confidence = float(probs[best_idx])
+
+    # Safeguard: reject photos that do not look like a clear maize leaf
+    ratio = plant_ratio(img)
+    reason = reject_reason(probs, ratio)
+    print(f"DEBUG predict: label={label} conf={confidence:.3f} "
+          f"plant_ratio={ratio:.3f} reject={reason}")
+    if reason:
+        return {
+            "not_leaf": True,
+            "low_confidence": True,
+            "reason": reason,
+            "message": "Could not recognise a clear maize leaf. Please retake the photo "
+                       "in good light with the leaf filling the frame."
+        }
 
     top3 = [
         {"label": CLASSES[int(i)], "confidence": round(float(probs[int(i)]), 4)}
